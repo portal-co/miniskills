@@ -180,15 +180,9 @@ The supported ZK proof system is **volar** — a system implementing VOLE-in-the
 
 **Reliability:** volar's ZK constructions are at the Experimental tier in volar's internal reliability classification (see `.miniskills/refs/reliability.md` — a reference copy; not a required component of miniskills). Do not use ZK attestation as the sole gating mechanism for IT4+ contributions in production repositories until volar's audit status improves.
 
-**The WASM frontend.** The primary build path for ZK-provable enforcers is volar's WASM frontend, which lifts ordinary WASM bytecode through WAFFLE (a WASM CFG IR) and VAFFLE into volar's own IR, making an existing scoring function ZK-provable without requiring the author to write in volar IR directly. The workflow:
+**The WASM frontend.** The primary path for ZK-provable enforcers is volar's WASM frontend, which lifts ordinary WASM bytecode through WAFFLE (a WASM CFG IR) and VAFFLE into volar's own IR. The enforcer WASM itself — the module linked in the miniskill's front-matter — is what gets lifted and proved. There is no intermediate build step that embeds a prover into the enforcer; the enforcer is plain logic, and volar proves its execution dynamically at attestation time.
 
-1. Write the scoring function in any WASM-targeting language (Rust, C, AssemblyScript).
-2. Compile it to a WASM module.
-3. Run volar's WASM frontend to lift it: WASM → WAFFLE → VAFFLE → Volar IR.
-4. volar generates VOLE prover and verifier code from the Volar IR.
-5. The prover is compiled into the enforcer WASM module (with the `assess`/`verify` wrapper from §7.1); the verifier is distributed as a native binary with the checker tool.
-
-This is the primary path and the main focus for enforcer development. Writing circuits directly in volar IR is also possible but is the secondary path.
+**The linker tool** (`miniskill-link`) composes the enforcer WASM with external components before passing them to volar. This is described in §5.3.
 
 **The VOLE relation.** Each wire in the boolean circuit carries the correlation:
 
@@ -208,17 +202,40 @@ The verifier checks `K_a · K_b + V̂_g = K_c · Δ` for each AND gate.
 
 ### 5.2 What goes in the `.vk` file for volar enforcers
 
-For standard-sig enforcers, `.vk` is a 32-byte Ed25519 public key.
+For standard-sig enforcers (no ZK), `.vk` is a 32-byte Ed25519 public key.
 
-For volar enforcers, `.vk` stores the verifier's *public parameters*: circuit structure (gate count, wire topology), extension field type T, security level N, and the Ed25519 public key used for the standard signature that wraps the proof. Δ is NOT stored — Δ is generated fresh per proof session and is never committed. The checker bot loads `.vk` to instantiate the volar verifier and check the V̂ values against the claimed wire assignments.
+For volar enforcers, `.vk` stores the verifier's *public parameters* for the **composed** circuit — the enforcer WASM linked together with its external components (Ed25519 verifier, vouch-keys, answer material) by the linker tool (§5.3). The public parameters include: circuit structure (gate count, wire topology), extension field type T, security level N, and the public inputs baked in from the linked components (vouch public keys, etc.). Δ is NOT stored — it is generated fresh per proof session. No separate Ed25519 signing key is committed; the ZK proof covers the entire computation, including any signature verification.
 
-volar ZK attestations carry both a standard signature and a ZK proof. Both are verifiable from the single `.vk` file.
+### 5.3 Enforcer integration and the linker tool
 
-### 5.3 Enforcer integration
+The enforcer WASM contains only domain-specific gate logic (probe scoring, challenge/response flow). It does not contain signing keys, ZK prover code, or verification logic for other token types. These are linked in externally by the `miniskill-link` tool, keeping the enforcer itself auditable and lightweight.
 
-The scoring function is compiled to WASM and lifted through volar's WASM frontend (WAFFLE → VAFFLE → Volar IR). volar generates the VOLE prover code from the Volar IR; this prover is compiled into the enforcer WASM module alongside the `assess`/`verify` ABI wrapper (§7.1). When `assess()` is called, it executes the VOLE prover over the gate response, producing V̂ values. These are serialised into the proof blob in the `MINISKILL-ATTEST` token.
+**`miniskill-link`** composes all components into a single WASM input for volar and derives the `.vk`. It is run once when the enforcer is first authored, and again whenever the enforcer or any component changes:
 
-The checker bot loads `.vk`, instantiates the volar verifier (a native binary generated separately from the same Volar IR, distributed with the checker tool), and runs the check — no WASM runtime required for verification. The verifier operates on the V̂ values and the public circuit parameters in `.vk`, without re-executing the scoring function.
+```
+miniskill-link \
+  --enforcer   [slug].gate.wasm \
+  --vouch-keys .miniskills/vouch-keys.txt \
+  --answer-key $GATE_KEY \
+  --output-vk  [slug].gate.wasm.vk
+```
+
+The tool links:
+- The enforcer WASM (scoring and challenge flow)
+- A standard Ed25519 signature verifier WASM (for vouch token verification)
+- Vouch public keys from `vouch-keys.txt` (as public constants in the circuit)
+- The gate's answer key (decrypted at link time using `GATE_KEY`; not stored in the enforcer)
+
+The combined WASM is lifted through volar's WASM frontend: WASM → WAFFLE → VAFFLE → Volar IR. volar generates the `.vk` from the composed circuit. The `.vk` is committed; the answer key and the linked Volar IR are not (the Volar IR is reproduced deterministically by running `miniskill-link` again from the same inputs).
+
+**At attestation time:**
+
+1. Runtime calls `enforcer.assess(gate_response)` — plain WASM execution; returns `AssessResult` (no ZK).
+2. Runtime runs the volar prover on the enforcer's execution trace using the linked circuit. This produces V̂ values attesting: "the enforcer, run on these inputs with these vouch keys and answer materials, produced this result."
+3. Runtime constructs the `MINISKILL-ATTEST` token from `AssessResult` and the V̂ values.
+4. Checker bot runs the volar native verifier against `.vk` — no WASM runtime, no enforcer execution, no separate Ed25519 call. The volar proof covers the entire computation including vouch signature checks.
+
+**What the proof covers:** Probe answer scoring, CT comparison, validity of any vouch signatures included in the gate response, and the correctness of the result. Nothing in the attestation is verified separately from the volar proof.
 
 ### 5.4 Token format with volar proof
 
@@ -228,11 +245,12 @@ MINISKILL-ATTEST: topic=cryptography | version=0.0.1 |
   result=PASS |
   proof-system=volar |
   proof=<base64-encoded V̂ list> |
-  vk-hash=sha256:<hash of .vk file> |
-  sig=<base64-encoded Ed25519 sig over canonical fields>
+  vk-hash=sha256:<hash of .vk file>
 ```
 
-The verification key (`[slug].gate.wasm.vk`) is committed to the repository. This makes volar-attested contributions verifiable entirely from static repository artefacts — no WASM runtime required for verification, only for generation.
+There is no separate `sig=` field for volar-attested tokens — the ZK proof is the cryptographic guarantee. The V̂ list, verified against `.vk`, proves that the composed computation (enforcer + vouch verifier + public keys) produced this result on these inputs. The `vk-hash` pins the specific linked version; if the enforcer or any component changes, `miniskill-link` must be re-run and a new `.vk` committed.
+
+Verification requires only the committed `.vk` file and the volar native verifier — no WASM runtime, no enforcer execution, no external key material.
 
 ### 5.5 Front-matter
 
@@ -259,8 +277,9 @@ The checker bot reads miniskill front-matter and validates the attestation recor
 5. For each miniskill in scope:
    - Find the best available attestation (prefer `MINISKILL-ATTEST` > `MINISKILL-REPLAY` > `MINISKILL-VOUCH` > `MINISKILL-SELF`).
    - Check whether the combination satisfies the IT requirement (§2).
-   - Validate signatures: for `MINISKILL-ATTEST`, verify the Ed25519 signature against `[slug].gate.wasm.vk`. If a `proof` field is present, load circuit parameters from `.vk` and run the volar verifier.
-   - Validate `MINISKILL-VOUCH` signatures against `.miniskills/vouch-keys.txt`.
+   - For `MINISKILL-ATTEST` with `proof-system=volar`: run the volar native verifier against `[slug].gate.wasm.vk`. The proof covers the entire computation — no separate Ed25519 call and no vouch-key validation needed; vouch verification is inside the proven circuit.
+   - For `MINISKILL-ATTEST` without a proof (standard-sig enforcer): verify the Ed25519 signature against `[slug].gate.wasm.vk` (32-byte raw public key).
+   - For `MINISKILL-VOUCH` tokens: validate the GPG/SSH signature against `.miniskills/vouch-keys.txt`. (Vouches that are referenced inside a volar-proven `MINISKILL-ATTEST` are already covered by the proof; standalone vouches still need explicit verification.)
    - For self-report: compare CT-SELF against miniskill `ct` front-matter.
 6. Post a structured summary as a PR comment. Mark the PR check as:
    - **Green**: all in-scope miniskills have sufficient attestation.
@@ -270,65 +289,48 @@ The checker bot reads miniskill front-matter and validates the attestation recor
 
 **No secrets required.** The `.vk` file and `vouch-keys.txt` are both committed artifacts. The checker bot requires no `MINISKILL_KEY` secret or equivalent — verification is entirely from static repository artifacts.
 
-**Verify-only mode.** The checker bot MUST NOT issue challenges to the model. Its role is to verify existing tokens, not to elicit new ones. When the checker invokes the enforcer (e.g. to replay a gate), it MUST use the `verify()` function, not `assess()`. See §8.1 for the ABI distinction.
+**Verify-only mode.** The checker bot MUST NOT issue challenges to the model. Its role is to verify existing tokens, not to elicit new ones. Token verification uses the volar native verifier against `.vk` — the checker bot does not invoke the enforcer's `assess` function.
 
 ---
 
 ## 7. WASM Enforcer ABI
 
-Every WASM attestation enforcer MUST export two functions. No other ABI surface is required or permitted for attestation purposes.
+The enforcer WASM exports a single function: `assess`. There is no `verify` export — token verification uses the volar native verifier against the committed `.vk` file (see §5.3). The enforcer does not contain signing keys, ZK prover code, or vouch-verification logic; those are composed in by `miniskill-link` before passing to volar.
 
-**Primary build path.** The volar WASM frontend (§5.1) is the recommended way to produce enforcer modules: write the scoring function in any WASM-targeting language → compile to WASM → lift through volar (WAFFLE → VAFFLE → Volar IR) → volar generates prover code → wrap with the ABI below and compile to the final `gate.wasm`. The volar toolchain handles the VOLE-in-the-head proving machinery; the ABI wrapper is minimal boilerplate. Direct hand-authorship of WASM enforcers is only needed when the scoring function cannot be expressed as a boolean circuit that volar can lift.
+The enforcer's job is: given a gate response, either request more information (challenge) or return a plain result. volar proves the execution of this function, including all linked components, to produce the cryptographic attestation.
 
-### 7.1 Exported Functions
+Optional export: `last_error(buf_ptr: i32, buf_len: i32) -> i32` — writes an error string; returns bytes written.
+
+### 7.1 Exported Function
 
 ```
 assess(gate_response_ptr: i32, gate_response_len: i32) -> i32
-  // Returns ptr to length-prefixed JSON blob in linear memory.
-  // Blob is either AttestResult (type: "result") or AttestChallenge (type: "challenge").
-
-verify(token_ptr: i32, token_len: i32, vk_ptr: i32, vk_len: i32) -> i32
-  // Stateless verify-only path. Returns 1 (pass) or 0 (fail).
-  // Errors (malformed token, unknown vk) are represented as 0, not as traps.
+  // Plain WASM execution. Returns ptr to length-prefixed JSON in linear memory.
+  // Blob is either AssessResult (type: "result") or AttestChallenge (type: "challenge").
+  // The runtime separately runs volar to prove this execution and produce the
+  // MINISKILL-ATTEST token.
 ```
-
-`assess` is called by the runtime after the contributor produces gate output. `verify` is called by the checker bot (or any third party) to validate a `MINISKILL-ATTEST` token using the committed `.vk` material. The checker bot MUST use `verify`, not `assess`. The two functions are stateless with respect to each other.
-
-Optional export: `last_error(buf_ptr: i32, buf_len: i32) -> i32` — writes an error string into the provided buffer; returns the number of bytes written.
 
 ### 7.2 Memory Layout
 
 Strings and byte slices cross the WASM boundary as (pointer, length) pairs in linear memory (32-bit indices into the WASM module's default memory).
 
-- **Inputs:** The host writes input data into the WASM linear memory before calling. `gate_response` and `token` are UTF-8 strings. `vk` is raw bytes. No null termination; length is always passed explicitly.
-- **Output of `assess`:** The first 4 bytes are a little-endian u32 length, followed by that many bytes of UTF-8 JSON (the `AttestResult` or `AttestChallenge`). The host MUST copy this out before making any further calls to the module — the module owns the memory region and MAY reuse it.
-- **Output of `verify`:** A single i32: 1 for pass, 0 for fail.
+- **Input:** The host writes `gate_response` (UTF-8) into WASM linear memory before calling. No null termination; length passed explicitly.
+- **Output:** The first 4 bytes are a little-endian u32 length, followed by that many bytes of UTF-8 JSON. The host MUST copy this out before making any further calls to the module — the module owns the memory region and MAY reuse it.
 
-### 7.3 AttestResult Schema
+### 7.3 AssessResult Schema
 
-`assess` returns a JSON object with `"type": "result"` when evaluation is complete.
+`assess` returns a JSON object with `"type": "result"` when evaluation is complete. The runtime adds the proof, `ct-required`, topic, and version fields when constructing the `MINISKILL-ATTEST` token.
 
 ```json
 {
   "type": "result",
   "model-claim": "claude opus-4-7",
-  "ct-required": 4,
   "ct-claimed": 4,
   "pass": true,
-  "probe-score": 0.82,        // optional; omit if no probe questions
-  "sig": "<base64>",          // Ed25519 over canonical fields
-  "proof": "<base64>",        // optional; volar V̂ list if zk-proof-system=volar
-  "proof-system": "volar"     // optional; omit if no ZK proof
+  "probe-score": 0.82        // optional; omit if no probe questions
 }
 ```
-
-**Canonical fields for signature** (pipe-delimited, alphabetical field order):
-
-```
-ct-claimed=[N]|ct-required=[N]|model-claim=[value]|pass=[true|false]|topic=[slug]|version=[N]
-```
-
-The enforcer signs these fields with Ed25519. The signing key is compiled into the WASM binary at build time; the corresponding public key is committed as `[slug].gate.wasm.vk`.
 
 ### 7.4 AttestChallenge Schema
 
@@ -384,64 +386,24 @@ This is non-compliant because it is imperative, provides no self-explanation, do
 
 ### 7.6 Key Material and Security Properties
 
-**The answer key is compiled in, not passed in.** The enforcer's scoring logic and answer key material MUST be compiled into the WASM binary at build time. The WASM ABI does not accept a key parameter. This means:
+**The enforcer WASM contains no key material.** Signing keys, vouch public keys, and answer material are linked in by `miniskill-link`, not compiled into the enforcer. This means the enforcer itself is fully auditable — it contains only the scoring and challenge logic, with no embedded secrets or cryptographic machinery.
 
-- The answer key is not extractable via the ABI: `assess` and `verify` do not expose the key material; they only expose the result of applying it.
-- The enforcer cannot be run without a WASM runtime. There is no native binary distribution; the WASM module IS the distribution.
-- Rotating the answer key requires recompiling and recommitting the enforcer binary and the `.vk` file. Old tokens remain verifiable against the old `.vk`.
+**Key material flow:**
+- `gate.key` (not committed): symmetric key used by `miniskill-link` to decrypt probe answer material at link time. It is a link-time secret. Once `miniskill-link` has run and produced the `.vk`, `gate.key` is not needed for attestation or verification — only for re-linking.
+- Answer material is a public input to the composed volar circuit (encrypted under the proof's public parameters), not a runtime secret passed to the enforcer.
+- Vouch public keys (from `vouch-keys.txt`) are public constants in the composed circuit, baked into `.vk` at link time.
 
-**`gate.key` (not committed):** Contains the symmetric key used to decrypt probe answer material during enforcer compilation. It is a build-time secret, not a runtime secret. Once the enforcer WASM is compiled, `gate.key` is no longer needed for attestation or verification — only for recompilation.
+**Rotating components:** Changing the enforcer WASM, vouch-keys, or answer material requires re-running `miniskill-link` and committing a new `.vk`. Old tokens remain verifiable against the old `.vk` indefinitely.
 
-### 7.7 Example Build Pipeline (volar WASM frontend path)
+### 7.7 Example Enforcer and Linker Invocation
 
-**Step 1 — Write the scoring function in a WASM-targeting language:**
-
-```rust
-// scoring/src/lib.rs  — compiled to WASM, then lifted by volar
-// Answer material is provided at build time via GATE_KEY env var and embedded.
-const ANSWER_KEY: &[u8] = include_bytes!(env!("GATE_ANSWER_KEY_PATH"));
-
-pub fn score_gate(answers: &GateAnswers) -> GateResult {
-    GateResult {
-        p01: check_sid_address(&answers.p01, ANSWER_KEY),    // corpus-density probe
-        p02: check_sid_revision(&answers.p02, ANSWER_KEY),   // calibration probe
-        p03: check_sid_firmware(&answers.p03, ANSWER_KEY),   // calibration probe
-    }
-}
-```
-
-```
-$ cargo build --target wasm32-unknown-unknown --release
-# produces: target/wasm32-unknown-unknown/release/scoring.wasm
-```
-
-**Step 2 — Lift through volar's WASM frontend:**
-
-```
-$ volar lift scoring.wasm --output scoring.vir
-# WASM → WAFFLE → VAFFLE → Volar IR
-```
-
-volar reads the WASM module, lifts it through WAFFLE (WASM CFG IR) and VAFFLE into Volar IR, producing a boolean-circuit representation of the scoring function.
-
-**Step 3 — Generate prover and verifier, emit the enforcer:**
-
-```
-$ volar build scoring.vir \
-    --signing-key $GATE_SIGNING_KEY \
-    --prover-target wasm \
-    --verifier-target native \
-    --output-wasm retro-computing-6502.gate.wasm \
-    --output-vk  retro-computing-6502.gate.wasm.vk \
-    --output-verifier checker-verifier
-```
-
-The volar toolchain wraps the prover with the `assess`/`verify` ABI (§7.1) automatically. The `assess` function handles both the challenge/response flow (when gate output is absent) and the VOLE proof generation (when gate output is present). The resulting `gate.wasm` and `gate.wasm.vk` are committed to the repo; `checker-verifier` is distributed with the checker tool.
-
-**ABI wrapper (for reference — generated by volar, not hand-written):**
+**The enforcer — plain scoring logic, no embedded keys or crypto:**
 
 ```rust
-// volar generates this wrapper around the VOLE prover
+// enforcer/src/lib.rs
+// No answer key. No signing key. No ZK prover.
+// Scoring is against answer material linked in by miniskill-link.
+
 #[no_mangle]
 pub extern "C" fn assess(gate_response_ptr: i32, gate_response_len: i32) -> i32 {
     let response = read_str(gate_response_ptr, gate_response_len);
@@ -455,32 +417,53 @@ pub extern "C" fn assess(gate_response_ptr: i32, gate_response_len: i32) -> i32 
         });
     }
 
-    let (v_hats, pass) = vole_prove_score_gate(parsed.probe_answers);
-    write_json(&AttestResult {
+    // score_probe_answers operates against answer material that is a public
+    // input to the volar circuit — not embedded here. The linker tool provides it.
+    let probe_score = score_probe_answers(&parsed.probe_answers);
+    write_json(&AssessResult {
         type_: "result",
         model_claim: parsed.model_claim.unwrap(),
-        ct_required: CT_THRESHOLD,
         ct_claimed: parsed.ct_claimed.unwrap(),
-        pass,
-        proof: Some(encode_v_hats(v_hats)),
-        proof_system: Some("volar"),
-        sig: sign_canonical(&canonical_fields(...), SIGNING_KEY),
-        ..Default::default()
+        pass: parsed.ct_claimed.unwrap() >= CT_THRESHOLD && probe_score >= PROBE_THRESHOLD,
+        probe_score: Some(probe_score),
     })
-}
-
-#[no_mangle]
-pub extern "C" fn verify(token_ptr: i32, token_len: i32, vk_ptr: i32, vk_len: i32) -> i32 {
-    let token = read_str(token_ptr, token_len);
-    let vk = read_bytes(vk_ptr, vk_len);
-    let parsed = parse_attest_token(&token);
-    let sig_ok = verify_ed25519_sig(&parsed.canonical_fields(), &parsed.sig, &vk);
-    let proof_ok = vole_verify_score_gate(&parse_v_hats(&parsed.proof), &vk);
-    (sig_ok && proof_ok) as i32
 }
 ```
 
-The build script reads `GATE_KEY`, decrypts the answer file, and writes the plaintext for `include_bytes!` to pick up. The WASM binary never contains the encryption key.
+```
+$ cargo build --target wasm32-unknown-unknown --release
+# produces: target/wasm32-unknown-unknown/release/enforcer.wasm
+# This is gate.wasm — commit it as-is.
+```
+
+**Run `miniskill-link` to compose components and derive `.vk`:**
+
+```
+$ miniskill-link \
+    --enforcer   retro-computing-6502.gate.wasm \
+    --vouch-keys .miniskills/vouch-keys.txt \
+    --answer-key $GATE_KEY \
+    --output-vk  retro-computing-6502.gate.wasm.vk
+```
+
+`miniskill-link` links the enforcer with the standard Ed25519 verifier WASM and the provided vouch keys and answer material. It feeds the composed WASM through volar's WASM frontend (WAFFLE → VAFFLE → Volar IR) and writes the `.vk` from the resulting circuit's public parameters. Commit `gate.wasm` and `gate.wasm.vk`; do not commit `$GATE_KEY`.
+
+**At attestation time (handled by the runtime, not by the enforcer author):**
+
+```
+1. result   = enforcer.assess(gate_response)   # plain WASM call
+2. v_hats   = volar.prove(enforcer, linked_circuit, gate_response, result)
+3. token    = build_attest_token(result, v_hats, vk_hash)
+   # MINISKILL-ATTEST: ... | proof=<V̂> | vk-hash=sha256:<.vk> | proof-system=volar
+```
+
+**Verification (checker bot, no WASM runtime needed):**
+
+```
+$ volar-verify retro-computing-6502.gate.wasm.vk <proof-from-token>
+# Runs the volar native verifier against the committed .vk.
+# No enforcer execution. No Ed25519 call. The proof covers everything.
+```
 
 ---
 
@@ -573,9 +556,9 @@ A token is any line matching `^MINISKILL-(SELF|ATTEST|VOUCH|REPLAY|CHALLENGE|RES
 
 | Token | Verification method |
 |-------|---------------------|
-| `MINISKILL-ATTEST` (standard sig) | Ed25519 verify over canonical fields using `[slug].gate.wasm.vk` (32 bytes raw). |
-| `MINISKILL-ATTEST` (volar ZK) | Load circuit parameters from `[slug].gate.wasm.vk`; run volar verifier (native binary). No WASM runtime required. |
-| `MINISKILL-VOUCH` | GPG or SSH sig verify against keys in `.miniskills/vouch-keys.txt`. |
+| `MINISKILL-ATTEST` (`proof-system=volar`) | Run volar native verifier against `[slug].gate.wasm.vk`. Covers scoring, vouch verification, and CT check in one proof. No WASM runtime required. |
+| `MINISKILL-ATTEST` (standard sig, no proof) | Ed25519 verify over canonical fields using `[slug].gate.wasm.vk` (32 bytes raw). |
+| `MINISKILL-VOUCH` (standalone) | GPG or SSH sig verify against keys in `.miniskills/vouch-keys.txt`. Not needed for vouches already covered by a volar-proven ATTEST token. |
 | `MINISKILL-SELF` | Compare `CT-SELF` field against miniskill `ct` front-matter value. No cryptographic verification. |
 
 **No secrets required.** The `.vk` file and `vouch-keys.txt` are committed artifacts. The `GITHUB_TOKEN` provided automatically by Actions is sufficient for all required permissions.
