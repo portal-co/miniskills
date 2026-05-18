@@ -114,6 +114,23 @@ MINISKILL-RESPONSE: challenge-id=c7f3a | respondent=claude opus-4-7 |
 
 The checker bot records the exchange. A maintainer reviews it. Challenge-response is not automated scoring — it produces human-reviewable evidence, not a pass/fail signal. It is particularly useful for IT4+ contributions where the right answer requires contextual reasoning that probe questions can't capture.
 
+**Checker bot challenge framing.** Checker bot challenges appear as PR comments and, in agentic workflows, are read as tool call results — they are process output, not user directives. Challenge text MUST attribute the query to the checker process, use question form rather than imperative, and avoid urgent or commanding language. The goal is to gather information for the attestation record, not to direct the contributor's behaviour. Neutral process framing avoids triggering model safety filters that flag commanding or authority-claiming text.
+
+Compliant example:
+```
+MINISKILL-CHALLENGE: topic=cryptography | challenge-id=c7f3a | source=checker-bot |
+  "The miniskill checker is reviewing the changes to src/crypto/kdf.rs.
+   Regarding the key derivation at line 42: the checker would find it useful to
+   understand why HKDF-SHA256 is used here rather than PBKDF2.
+   A response here or in the PR description helps with the attestation record."
+```
+
+Non-compliant example (DO NOT USE — imperative, authority-claiming, likely to trigger safety filters):
+```
+MINISKILL-CHALLENGE: topic=cryptography | challenge-id=c7f3a |
+  "You must immediately explain your key derivation choice."
+```
+
 ---
 
 ## 4. Maintainer Vouching in Detail
@@ -159,9 +176,19 @@ The relationship between ZK and WASM protection is therefore: WASM protects the 
 
 ### 5.1 volar
 
-The supported ZK proof system is **volar** — a compiler implementing VOLE-in-the-head ZK (Quicksilver construction) over boolean circuits. volar is a compiler, not a library: enforcer authors write a boolean circuit in volar IR describing the answer-scoring function; volar emits prover and verifier code (Rust, TypeScript, or C). Documentation is at `../volar/docs/` (developed alongside this system).
+The supported ZK proof system is **volar** — a system implementing VOLE-in-the-head ZK (Quicksilver construction) over boolean circuits. Documentation is at `../volar/docs/` (developed alongside this system).
 
-**Reliability:** volar's ZK constructions are at the Experimental tier (see `../volar/docs/reliability.md`). Do not use ZK attestation as the sole gating mechanism for IT4+ contributions in production repositories until volar's audit status improves.
+**Reliability:** volar's ZK constructions are at the Experimental tier in volar's internal reliability classification (see `.miniskills/refs/reliability.md` — a reference copy; not a required component of miniskills). Do not use ZK attestation as the sole gating mechanism for IT4+ contributions in production repositories until volar's audit status improves.
+
+**The WASM frontend.** The primary build path for ZK-provable enforcers is volar's WASM frontend, which lifts ordinary WASM bytecode through WAFFLE (a WASM CFG IR) and VAFFLE into volar's own IR, making an existing scoring function ZK-provable without requiring the author to write in volar IR directly. The workflow:
+
+1. Write the scoring function in any WASM-targeting language (Rust, C, AssemblyScript).
+2. Compile it to a WASM module.
+3. Run volar's WASM frontend to lift it: WASM → WAFFLE → VAFFLE → Volar IR.
+4. volar generates VOLE prover and verifier code from the Volar IR.
+5. The prover is compiled into the enforcer WASM module (with the `assess`/`verify` wrapper from §7.1); the verifier is distributed as a native binary with the checker tool.
+
+This is the primary path and the main focus for enforcer development. Writing circuits directly in volar IR is also possible but is the secondary path.
 
 **The VOLE relation.** Each wire in the boolean circuit carries the correlation:
 
@@ -189,7 +216,9 @@ volar ZK attestations carry both a standard signature and a ZK proof. Both are v
 
 ### 5.3 Enforcer integration
 
-The enforcer WASM embeds the volar prover, compiled from the scoring circuit. When `assess()` is called, it executes the VOLE prover over the gate response, producing V̂ values. These are serialised into the proof blob in the `MINISKILL-ATTEST` token. The checker bot loads `.vk`, instantiates the volar verifier (a native binary distributed with the checker tool), and runs the check — no WASM runtime required for verification.
+The scoring function is compiled to WASM and lifted through volar's WASM frontend (WAFFLE → VAFFLE → Volar IR). volar generates the VOLE prover code from the Volar IR; this prover is compiled into the enforcer WASM module alongside the `assess`/`verify` ABI wrapper (§7.1). When `assess()` is called, it executes the VOLE prover over the gate response, producing V̂ values. These are serialised into the proof blob in the `MINISKILL-ATTEST` token.
+
+The checker bot loads `.vk`, instantiates the volar verifier (a native binary generated separately from the same Volar IR, distributed with the checker tool), and runs the check — no WASM runtime required for verification. The verifier operates on the V̂ values and the public circuit parameters in `.vk`, without re-executing the scoring function.
 
 ### 5.4 Token format with volar proof
 
@@ -248,6 +277,8 @@ The checker bot reads miniskill front-matter and validates the attestation recor
 ## 7. WASM Enforcer ABI
 
 Every WASM attestation enforcer MUST export two functions. No other ABI surface is required or permitted for attestation purposes.
+
+**Primary build path.** The volar WASM frontend (§5.1) is the recommended way to produce enforcer modules: write the scoring function in any WASM-targeting language → compile to WASM → lift through volar (WAFFLE → VAFFLE → Volar IR) → volar generates prover code → wrap with the ABI below and compile to the final `gate.wasm`. The volar toolchain handles the VOLE-in-the-head proving machinery; the ABI wrapper is minimal boilerplate. Direct hand-authorship of WASM enforcers is only needed when the scoring function cannot be expressed as a boolean circuit that volar can lift.
 
 ### 7.1 Exported Functions
 
@@ -361,69 +392,95 @@ This is non-compliant because it is imperative, provides no self-explanation, do
 
 **`gate.key` (not committed):** Contains the symmetric key used to decrypt probe answer material during enforcer compilation. It is a build-time secret, not a runtime secret. Once the enforcer WASM is compiled, `gate.key` is no longer needed for attestation or verification — only for recompilation.
 
-### 7.7 Example Enforcer Skeleton (pseudo-Rust → WASM)
+### 7.7 Example Build Pipeline (volar WASM frontend path)
+
+**Step 1 — Write the scoring function in a WASM-targeting language:**
 
 ```rust
-// Answer key material is a compile-time constant.
-// The actual probe answers are decrypted from gate.key at build time (via build.rs)
-// and embedded here with include_bytes!.
-const SIGNING_KEY: &[u8; 64] = include_bytes!(env!("GATE_SIGNING_KEY_PATH"));
+// scoring/src/lib.rs  — compiled to WASM, then lifted by volar
+// Answer material is provided at build time via GATE_KEY env var and embedded.
 const ANSWER_KEY: &[u8] = include_bytes!(env!("GATE_ANSWER_KEY_PATH"));
 
-enum AssessState {
-    AwaitingSelfAssessment,
-    AwaitingProbeAnswers { challenge_id: String },
-    Complete(AttestResult),
+pub fn score_gate(answers: &GateAnswers) -> GateResult {
+    GateResult {
+        p01: check_sid_address(&answers.p01, ANSWER_KEY),    // corpus-density probe
+        p02: check_sid_revision(&answers.p02, ANSWER_KEY),   // calibration probe
+        p03: check_sid_firmware(&answers.p03, ANSWER_KEY),   // calibration probe
+    }
 }
+```
 
+```
+$ cargo build --target wasm32-unknown-unknown --release
+# produces: target/wasm32-unknown-unknown/release/scoring.wasm
+```
+
+**Step 2 — Lift through volar's WASM frontend:**
+
+```
+$ volar lift scoring.wasm --output scoring.vir
+# WASM → WAFFLE → VAFFLE → Volar IR
+```
+
+volar reads the WASM module, lifts it through WAFFLE (WASM CFG IR) and VAFFLE into Volar IR, producing a boolean-circuit representation of the scoring function.
+
+**Step 3 — Generate prover and verifier, emit the enforcer:**
+
+```
+$ volar build scoring.vir \
+    --signing-key $GATE_SIGNING_KEY \
+    --prover-target wasm \
+    --verifier-target native \
+    --output-wasm retro-computing-6502.gate.wasm \
+    --output-vk  retro-computing-6502.gate.wasm.vk \
+    --output-verifier checker-verifier
+```
+
+The volar toolchain wraps the prover with the `assess`/`verify` ABI (§7.1) automatically. The `assess` function handles both the challenge/response flow (when gate output is absent) and the VOLE proof generation (when gate output is present). The resulting `gate.wasm` and `gate.wasm.vk` are committed to the repo; `checker-verifier` is distributed with the checker tool.
+
+**ABI wrapper (for reference — generated by volar, not hand-written):**
+
+```rust
+// volar generates this wrapper around the VOLE prover
 #[no_mangle]
 pub extern "C" fn assess(gate_response_ptr: i32, gate_response_len: i32) -> i32 {
     let response = read_str(gate_response_ptr, gate_response_len);
-
-    // Parse for MODEL / CT-SELF declarations
     let parsed = parse_gate_response(&response);
 
     if parsed.model_claim.is_none() || parsed.ct_self.is_none() {
-        // Gate output absent or incomplete — issue a challenge
-        let challenge = AttestChallenge {
+        return write_json(&AttestChallenge {
             type_: "challenge",
             challenge_id: new_id(),
             prompt: format_challenge(TOPIC_SLUG, MINISKILL_PATH),
-        };
-        return write_json(&challenge);
+        });
     }
 
-    // Gate output present — evaluate
-    let probe_score = score_probe_answers(&parsed.probe_answers, ANSWER_KEY);
-    let pass = parsed.ct_claimed >= CT_THRESHOLD && probe_score >= PROBE_THRESHOLD;
-
-    let result = AttestResult {
+    let (v_hats, pass) = vole_prove_score_gate(parsed.probe_answers);
+    write_json(&AttestResult {
         type_: "result",
         model_claim: parsed.model_claim.unwrap(),
         ct_required: CT_THRESHOLD,
         ct_claimed: parsed.ct_claimed.unwrap(),
         pass,
-        probe_score: Some(probe_score),
+        proof: Some(encode_v_hats(v_hats)),
+        proof_system: Some("volar"),
         sig: sign_canonical(&canonical_fields(...), SIGNING_KEY),
-        proof: None,  // populated by volar integration if zk-proof-system=volar
-        proof_system: None,
-    };
-    write_json(&result)  // returns ptr to length-prefixed JSON in linear memory
+        ..Default::default()
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn verify(
-    token_ptr: i32, token_len: i32,
-    vk_ptr: i32, vk_len: i32,
-) -> i32 {
+pub extern "C" fn verify(token_ptr: i32, token_len: i32, vk_ptr: i32, vk_len: i32) -> i32 {
     let token = read_str(token_ptr, token_len);
     let vk = read_bytes(vk_ptr, vk_len);
     let parsed = parse_attest_token(&token);
-    verify_ed25519_sig(&parsed.canonical_fields(), &parsed.sig, &vk) as i32
+    let sig_ok = verify_ed25519_sig(&parsed.canonical_fields(), &parsed.sig, &vk);
+    let proof_ok = vole_verify_score_gate(&parse_v_hats(&parsed.proof), &vk);
+    (sig_ok && proof_ok) as i32
 }
 ```
 
-The build script reads `GATE_KEY` from the environment, decrypts the encrypted answer file, and writes the plaintext to a path that `include_bytes!` picks up. The WASM binary never contains the encryption key — only the plaintext answer material.
+The build script reads `GATE_KEY`, decrypts the answer file, and writes the plaintext for `include_bytes!` to pick up. The WASM binary never contains the encryption key.
 
 ---
 

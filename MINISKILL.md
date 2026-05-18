@@ -16,7 +16,7 @@
 
 **Single file per miniskill.** The skill and gate spec live together. The WASM enforcer is a sidecar, not a required component. Simpler to author, simpler to review, simpler to link.
 
-**Prior art.** The immediate precursor to this system is the reliability and AI tier policy in [`../volar/docs/reliability.md`](../volar/docs/reliability.md). That system routes AI contributions within a single trusted codebase using hardcoded model-to-tier mappings (Glue / Compiler / Cryptography), enforced through human code review — no attestation, no portability. Miniskills extend the same insight (capability routing is a precondition for AI contribution quality, not a post-hoc filter) into an open, portable, machine-attested form.
+**Prior art.** The immediate precursor to this system is the reliability and AI tier policy documented in [`.miniskills/refs/reliability.md`](.miniskills/refs/reliability.md) (copied from `volar/docs/reliability.md`, where it was developed). That system routes AI contributions within a single trusted codebase using hardcoded model-to-tier mappings (Glue / Compiler / Cryptography), enforced through human code review — no attestation, no portability. Miniskills extend the same insight (capability routing is a precondition for AI contribution quality, not a post-hoc filter) into an open, portable, machine-attested form. The reliability tier system is a reference document, not a required component of miniskills.
 
 ---
 
