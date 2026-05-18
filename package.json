@@ -1,0 +1,9 @@
+{
+  "description": "Skills + improper AI usage in one package",
+  "devDependencies": {
+    "zshy": "^0.7.0"
+  },
+  "name": "@portal-solutions/miniskills",
+  "type": "module",
+  "workspaces": []
+}
