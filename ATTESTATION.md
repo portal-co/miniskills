@@ -289,7 +289,9 @@ The checker bot reads miniskill front-matter and validates the attestation recor
 
 **No secrets required.** The `.vk` file and `vouch-keys.txt` are both committed artifacts. The checker bot requires no `MINISKILL_KEY` secret or equivalent — verification is entirely from static repository artifacts.
 
-**Verify-only mode.** The checker bot MUST NOT issue challenges to the model. Its role is to verify existing tokens, not to elicit new ones. Token verification uses the volar native verifier against `.vk` — the checker bot does not invoke the enforcer's `assess` function.
+**Challenge capability.** The checker bot MAY post challenges as PR comments when no runtime-issued challenge has been detected and gate output is absent or insufficient. This is the appropriate path when the contribution harness is untrusted or when the runtime does not support the enforcer's `assess` flow. Checker-bot challenges follow the same scoping and framing requirements as §7.5 — they must be clearly attributed to the checker process, question form not imperative, and must reference the miniskill file path so the legitimacy can be independently verified.
+
+The checker bot does NOT invoke the enforcer's `assess` function. Challenges it posts are formulated from the miniskill's gate section (the probe questions and self-assessment format), not from a live enforcer execution. Token verification uses the volar native verifier against `.vk`.
 
 ---
 

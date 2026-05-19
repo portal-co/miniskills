@@ -1,0 +1,11 @@
+[package]
+name = "miniskill-parse"
+version.workspace = true
+edition = "2021"
+description = "Parser and emitter for machine-readable miniskill syntax"
+
+[dependencies]
+nom = "7"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
