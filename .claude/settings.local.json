@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/grahamkelly/Code/portal-hot/volar -type f -name \"README*\" -o -name \"*.md\" | head -20)",
+      "Read(//Users/grahamkelly/Code/portal-hot/volar/**)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)"
+    ]
+  }
+}
